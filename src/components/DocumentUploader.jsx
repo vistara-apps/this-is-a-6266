@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { synthesizeText } from '../services/aiService';
-import { Upload, FileText, Link, Loader2, AlertCircle } from 'lucide-react';
+import { scrapeWebContent, extractTextFromFile, webScrapingRateLimiter } from '../services/webScrapingService';
+import BusinessLogicService from '../services/businessLogic';
+import { Upload, FileText, Link, Loader2, AlertCircle, Globe } from 'lucide-react';
 
 export default function DocumentUploader() {
   const { state, dispatch } = useApp();
@@ -12,9 +14,119 @@ export default function DocumentUploader() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState('');
 
+  const handleUrlScraping = async () => {
+    if (!inputUrl.trim()) {
+      setError('Please provide a URL to scrape');
+      return;
+    }
+
+    // Check business logic permissions
+    const canScrape = BusinessLogicService.canUseWebScraping(state.user);
+    if (!canScrape.allowed) {
+      setError(canScrape.message);
+      return;
+    }
+
+    // Check rate limiting
+    if (!webScrapingRateLimiter.canMakeRequest()) {
+      setError('Rate limit exceeded. Please try again later.');
+      return;
+    }
+
+    setIsProcessing(true);
+    setError('');
+
+    try {
+      const scrapedContent = await scrapeWebContent(inputUrl);
+      setInputText(scrapedContent.content);
+      
+      // Record usage
+      BusinessLogicService.recordUsage(state.user, 'webScraping');
+      webScrapingRateLimiter.recordRequest();
+      
+      // Auto-synthesize if content is available
+      if (scrapedContent.content) {
+        const result = await synthesizeText(scrapedContent.content, customPrompt);
+        
+        // Save synthesis result
+        const synthesisId = Date.now().toString();
+        dispatch({
+          type: 'SET_SYNTHESIS_RESULT',
+          payload: {
+            id: synthesisId,
+            result: {
+              originalText: scrapedContent.content,
+              summary: result,
+              prompt: customPrompt,
+              sourceUrl: inputUrl,
+              sourceTitle: scrapedContent.title,
+              createdAt: new Date().toISOString(),
+            }
+          }
+        });
+
+        // Record synthesis usage
+        BusinessLogicService.recordUsage(state.user, 'synthesis');
+
+        // Optionally create a note from the synthesis
+        const shouldSaveAsNote = confirm(`Save synthesis of "${scrapedContent.title}" as a note?`);
+        if (shouldSaveAsNote) {
+          const title = prompt('Enter note title:') || scrapedContent.title;
+          dispatch({
+            type: 'ADD_NOTE',
+            payload: {
+              userId: state.user.userId,
+              projectId: state.activeProject,
+              title,
+              content: result,
+              sourceUrl: inputUrl,
+              tags: ['ai-synthesis', 'web-content'],
+              createdAt: new Date().toISOString(),
+            }
+          });
+        }
+      }
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    // Check file size limits
+    const canUpload = BusinessLogicService.canUploadFile(state.user, file.size);
+    if (!canUpload.allowed) {
+      setError(canUpload.message);
+      return;
+    }
+
+    setIsProcessing(true);
+    setError('');
+
+    try {
+      const extractedContent = await extractTextFromFile(file);
+      setInputText(extractedContent.content);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const handleSynthesize = async () => {
     if (!inputText.trim()) {
       setError('Please provide text to analyze');
+      return;
+    }
+
+    // Check business logic permissions
+    const canSynthesize = BusinessLogicService.canUseSynthesis(state.user);
+    if (!canSynthesize.allowed) {
+      setError(canSynthesize.message);
       return;
     }
 
@@ -23,6 +135,9 @@ export default function DocumentUploader() {
 
     try {
       const result = await synthesizeText(inputText, customPrompt);
+      
+      // Record usage
+      BusinessLogicService.recordUsage(state.user, 'synthesis');
       
       // Save synthesis result
       const synthesisId = Date.now().toString();
@@ -68,37 +183,7 @@ export default function DocumentUploader() {
     }
   };
 
-  const handleFileUpload = async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      setInputText(e.target.result);
-      setUploadType('text');
-    };
-    reader.readAsText(file);
-  };
-
-  const handleUrlFetch = async () => {
-    if (!inputUrl.trim()) {
-      setError('Please enter a valid URL');
-      return;
-    }
-
-    setIsProcessing(true);
-    setError('');
-
-    try {
-      // Note: In a real app, you'd use a backend service to fetch URL content
-      // For demo purposes, we'll show a message
-      setError('URL fetching requires a backend service. Please copy and paste the text instead.');
-    } catch (error) {
-      setError('Failed to fetch URL content');
-    } finally {
-      setIsProcessing(false);
-    }
-  };
 
   return (
     <div className="space-y-6">
@@ -136,7 +221,7 @@ export default function DocumentUploader() {
               : 'text-textSecondary hover:text-textPrimary'
           }`}
         >
-          <Link className="w-4 h-4" />
+          <Globe className="w-4 h-4" />
           <span>URL</span>
         </button>
       </div>
@@ -198,11 +283,11 @@ export default function DocumentUploader() {
                 className="flex-1 p-3 border border-border rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent transition-colors"
               />
               <button
-                onClick={handleUrlFetch}
+                onClick={handleUrlScraping}
                 disabled={isProcessing}
                 className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-opacity-90 disabled:opacity-50 transition-colors"
               >
-                Fetch
+                {isProcessing ? 'Scraping...' : 'Scrape & Analyze'}
               </button>
             </div>
           </div>
